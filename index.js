@@ -1,10 +1,11 @@
 const express = require('express');
 const fetch = require('node-fetch');
-const app = express();
+const http = require('http');
+const WebSocket = require('ws');
 
+const app = express();
 app.use(express.json());
 
-// CORS — allow everything
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -37,38 +38,84 @@ app.post('/tts', async (req, res) => {
   }
 });
 
-// ── DonationAlerts user proxy ──
-app.get('/da/user', async (req, res) => {
-  try {
-    const response = await fetch('https://www.donationalerts.com/api/v1/user/oauth', {
-      headers: { 'Authorization': `Bearer ${DA_TOKEN}` }
-    });
-    const data = await response.json();
-    res.json(data);
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── DonationAlerts centrifuge subscribe proxy ──
-app.post('/da/subscribe', async (req, res) => {
-  try {
-    const response = await fetch('https://www.donationalerts.com/api/v1/centrifuge/subscribe', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${DA_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(req.body)
-    });
-    const data = await response.json();
-    res.json(data);
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 app.get('/', (req, res) => res.send('Proxy OK'));
 
+// ── HTTP server + WebSocket server for DA relay ──
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/da-relay' });
+
+// Store connected stream clients
+const streamClients = new Set();
+
+wss.on('connection', (ws) => {
+  console.log('Stream client connected');
+  streamClients.add(ws);
+  ws.on('close', () => streamClients.delete(ws));
+});
+
+function broadcastDonation(data) {
+  const msg = JSON.stringify({ type: 'donation', data });
+  streamClients.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  });
+}
+
+// ── Connect to DonationAlerts from server side ──
+async function connectDA() {
+  try {
+    // Get user info and socket token
+    const userResp = await fetch('https://www.donationalerts.com/api/v1/user/oauth', {
+      headers: { 'Authorization': `Bearer ${DA_TOKEN}` }
+    });
+    const user = await userResp.json();
+    const userId = user.data && user.data.id;
+    const socketToken = user.data && user.data.socket_connection_token;
+    if (!socketToken) { console.error('DA: no socket token'); setTimeout(connectDA, 15000); return; }
+
+    // Get centrifuge channel token
+    const subResp = await fetch('https://www.donationalerts.com/api/v1/centrifuge/subscribe', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${DA_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channels: [`$alerts:donation_${userId}`] })
+    });
+    const subData = await subResp.json();
+    const channels = subData.channels || [];
+
+    // Connect to centrifuge WS
+    const daWS = new WebSocket('wss://centrifugo.donationalerts.com/connection/websocket');
+
+    daWS.on('open', () => {
+      console.log('DA centrifuge connected');
+      daWS.send(JSON.stringify({ params: { token: socketToken }, id: 1 }));
+    });
+
+    daWS.on('message', (raw) => {
+      const data = JSON.parse(raw);
+      // Subscribe to channel after connect
+      if (data.id === 1 && data.result) {
+        channels.forEach((ch, i) => {
+          daWS.send(JSON.stringify({ method: 1, params: { channel: ch.channel, token: ch.token }, id: 2 + i }));
+        });
+      }
+      // Relay donation to stream clients
+      if (data.result && data.result.data && data.result.data.data) {
+        const donation = data.result.data.data;
+        console.log('Donation:', donation.username, donation.amount, donation.currency);
+        broadcastDonation(donation);
+      }
+    });
+
+    daWS.on('close', () => { console.log('DA disconnected, reconnecting...'); setTimeout(connectDA, 5000); });
+    daWS.on('error', (e) => console.error('DA error:', e.message));
+
+  } catch(e) {
+    console.error('DA connection failed:', e.message);
+    setTimeout(connectDA, 15000);
+  }
+}
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Proxy running on port ${PORT}`);
+  connectDA();
+});
